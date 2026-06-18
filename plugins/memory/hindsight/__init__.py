@@ -647,16 +647,15 @@ class HindsightMemoryProvider(MemoryProvider):
         self._recall_prompt_preamble = ""
         self._recall_max_input_chars = 800
 
-        # relevance + novelty controls for auto-recall.
-        # The stock plugin flattens EVERY recalled result into context on every
-        # turn (no cap, no dedup) — for a bank that fits under recall_max_tokens
-        # that means the whole bank, re-injected each message. These three knobs
-        # cap the count, suppress recently-shown observations, and reserve a
-        # score floor for later. Set all to 0 to reproduce stock behavior.
+        # Relevance and novelty controls for auto-recall. Without them, every
+        # recalled result is injected on every turn; for a bank that fits under
+        # recall_max_tokens that re-injects the whole bank each message. These
+        # three knobs cap the count, suppress recently-shown observations, and
+        # apply a relevance floor.
         self._recall_top_k = 8            # max observations injected per turn (0 = unlimited)
-        # Novelty: -1 = NEVER re-inject an observation already shown this
-        # session (default); 0 = no suppression (repeats allowed); N>0 = let an
-        # observation come back after N recall turns.
+        # Novelty window: -1 = never re-inject an observation already shown this
+        # session (default); 0 = no suppression (repeats allowed); N > 0 = an
+        # observation may reappear after N recall turns.
         self._recall_suppress_window = -1
         self._recall_min_score = 0.0      # drop results below this cross-encoder score (0 = off; needs trace)
         self._recently_shown: Dict[str, int] = {}  # observation id -> recall-turn last injected
@@ -665,10 +664,9 @@ class HindsightMemoryProvider(MemoryProvider):
         # Bank
         self._bank_mission = ""
         self._bank_retain_mission: str | None = None
-        # extra bank-config knobs we ACTUALLY push to the
-        # bank on initialize(). The stock plugin reads bank_*mission and never
-        # sends them (dead keys); we apply them via the Hindsight bank-config
-        # API. None = "leave the bank's current value untouched".
+        # Bank-config knobs applied to the bank on initialize() via the
+        # Hindsight bank-config API. None means "leave the bank's current
+        # value untouched".
         self._observations_mission: str | None = None
         self._retain_extraction_mode: str | None = None
         self._retain_custom_instructions: str | None = None
@@ -945,11 +943,11 @@ class HindsightMemoryProvider(MemoryProvider):
             {"key": "llm_model", "description": "LLM model", "default": "gpt-4o-mini", "default_from": {"field": "llm_provider", "map": _PROVIDER_DEFAULT_MODELS}, "when": {"mode": "local_embedded"}},
             {"key": "bank_id", "description": "Memory bank name (static fallback when bank_id_template is unset)", "default": "hermes"},
             {"key": "bank_id_template", "description": "Optional template to derive bank_id dynamically. Placeholders: {profile}, {workspace}, {platform}, {user}, {session}. Example: hermes-{profile}", "default": ""},
-            {"key": "bank_mission", "description": "pushed to the bank as reflect_mission (first-person identity/framing for reflect). Empty = leave bank as-is."},
-            {"key": "bank_retain_mission", "description": "pushed to the bank as retain_mission — steers WHAT gets extracted from each turn. Empty = leave bank as-is."},
-            {"key": "observations_mission", "description": "pushed to the bank as observations_mission — steers WHAT gets synthesized into durable observations (the layer recall surfaces). Highest-leverage knob for reducing junk. Empty = leave bank as-is."},
-            {"key": "retain_extraction_mode", "description": "pushed to the bank — fact extraction mode. Empty = leave bank as-is.", "choices": ["concise", "verbose", "custom"]},
-            {"key": "retain_custom_instructions", "description": "pushed to the bank — custom extraction prompt (only active when retain_extraction_mode='custom'). Empty = leave bank as-is."},
+            {"key": "bank_mission", "description": "Pushed to the bank as reflect_mission (first-person identity/framing for reflect). Empty leaves the bank as-is."},
+            {"key": "bank_retain_mission", "description": "Pushed to the bank as retain_mission; steers what gets extracted from each turn. Empty leaves the bank as-is."},
+            {"key": "observations_mission", "description": "Pushed to the bank as observations_mission; steers what gets synthesized into durable observations (the layer recall surfaces). The most effective knob for reducing low-value observations. Empty leaves the bank as-is."},
+            {"key": "retain_extraction_mode", "description": "Pushed to the bank; fact extraction mode. Empty leaves the bank as-is.", "choices": ["concise", "verbose", "custom"]},
+            {"key": "retain_custom_instructions", "description": "Pushed to the bank; custom extraction prompt (only active when retain_extraction_mode='custom'). Empty leaves the bank as-is."},
             {"key": "recall_budget", "description": "Recall thoroughness", "default": "mid", "choices": ["low", "mid", "high"]},
             {"key": "memory_mode", "description": "Memory integration mode", "default": "hybrid", "choices": ["hybrid", "context", "tools"]},
             {"key": "recall_prefetch_method", "description": "Auto-recall method", "default": "recall", "choices": ["recall", "reflect"]},
@@ -968,9 +966,9 @@ class HindsightMemoryProvider(MemoryProvider):
             {"key": "retain_context", "description": "Context label for retained memories", "default": "conversation between Hermes Agent and the User"},
             {"key": "recall_max_tokens", "description": "Maximum tokens for recall results", "default": 4096},
             {"key": "recall_max_input_chars", "description": "Maximum input query length for auto-recall", "default": 800},
-            {"key": "recall_top_k", "description": "max observations injected per auto-recall turn (0 = unlimited, original behavior)", "default": 8},
-            {"key": "recall_suppress_window", "description": "don't re-feed the agent observations it has already been shown. -1 (default) = never repeat an observation already shown this session; 0 = off (repeats allowed every turn); N>0 = allow an observation to reappear after N auto-recall turns. Resets each new session.", "default": -1},
-            {"key": "recall_min_score", "description": "drop auto-recall results whose cross-encoder relevance score is below this (0.0-1.0; 0 = off). When >0, recall is fetched with trace to obtain scores. Try ~0.05-0.1 to cut the long noise tail.", "default": 0.0},
+            {"key": "recall_top_k", "description": "Max observations injected per auto-recall turn (0 = unlimited).", "default": 8},
+            {"key": "recall_suppress_window", "description": "Avoid re-injecting observations already shown to the agent. -1 (default) = never repeat an observation shown this session; 0 = off (repeats allowed every turn); N > 0 = an observation may reappear after N auto-recall turns. Resets each new session.", "default": -1},
+            {"key": "recall_min_score", "description": "Drop auto-recall results whose cross-encoder relevance score is below this (0.0-1.0; 0 = off). When >0, recall is fetched with trace to obtain scores. Try ~0.05-0.1 to drop the low-relevance tail.", "default": 0.0},
             {"key": "recall_prompt_preamble", "description": "Custom preamble for recalled memories in context"},
             {"key": "timeout", "description": "API request timeout in seconds", "default": _DEFAULT_TIMEOUT},
             {"key": "idle_timeout", "description": "Embedded daemon idle timeout in seconds (0 disables auto-shutdown)", "default": _DEFAULT_IDLE_TIMEOUT, "when": {"mode": "local_embedded"}},
@@ -1403,13 +1401,10 @@ class HindsightMemoryProvider(MemoryProvider):
     def _apply_bank_config(self) -> None:
         """Push configured bank-level missions / extraction settings to the bank.
 
-        This is the piece the stock Hindsight plugin is missing: it reads
-        ``bank_mission`` / ``bank_retain_mission`` from config and then never
-        sends them, so they're dead keys. This plugin actually applies
-        them — plus ``observations_mission`` (which has no stock config key at
-        all) and the extraction-mode knobs — via the Hindsight bank-config API
-        (``PUT /banks/{id}/config``, the same endpoint as ``hindsight bank
-        set-config``).
+        Applies ``bank_mission`` (reflect_mission), ``bank_retain_mission``
+        (retain_mission), ``observations_mission``, and the extraction-mode
+        knobs via the Hindsight bank-config API (``PUT /banks/{id}/config``,
+        the same endpoint as ``hindsight bank set-config``).
 
         Only keys the user explicitly set are sent; an unset value is omitted
         so the bank's current setting is left untouched (never blanked).
@@ -1464,16 +1459,13 @@ class HindsightMemoryProvider(MemoryProvider):
         )
 
     def prefetch(self, query: str, *, session_id: str = "") -> str:
-        """Recall observations for the CURRENT message and return them to inject.
+        """Recall observations for the current message and return them to inject.
 
-        This recalls **synchronously** against ``query`` — the message the agent
-        is about to answer. The stock plugin (and our earlier versions) used a
-        prefetch/queue model that recalled on the PREVIOUS turn's message and
-        served it one turn late, so the agent answered a question without the
-        memories relevant to it. The cost of doing it right is that the recall's
-        latency is now on the turn's critical path (bounded by the configured
-        request timeout). Returns "" on any skip/failure — memory is
-        best-effort and must never break a turn.
+        Recall runs synchronously against ``query`` — the message the agent is
+        about to answer — so the injected memories are relevant to the current
+        turn. The trade-off is that recall latency is on the turn's critical
+        path (bounded by the configured request timeout). Returns "" on any
+        skip or failure; memory is best-effort and must never break a turn.
         """
         text = self._recall_for_query(query)
         if not text:
@@ -1486,11 +1478,9 @@ class HindsightMemoryProvider(MemoryProvider):
         return f"{header}\n\n{text}"
 
     def queue_prefetch(self, query: str, *, session_id: str = "") -> None:
-        """No-op. Recall now runs synchronously in prefetch() against the
-        current message. The stock pre-warm model recalled on the just-finished
-        message and surfaced it a turn late, so the agent always saw the
-        PREVIOUS message's observations. Kept as a no-op so the MemoryManager's
-        post-turn queue_prefetch_all() call stays harmless.
+        """No-op. Recall runs synchronously in prefetch() against the current
+        message, so there is nothing to pre-warm. Kept as a no-op so the
+        MemoryManager's post-turn queue_prefetch_all() call stays harmless.
         """
         return
 
@@ -1517,8 +1507,8 @@ class HindsightMemoryProvider(MemoryProvider):
             query = query[:self._recall_max_input_chars]
 
         # Load this session's "already shown" ledger from disk. In production
-        # the provider is rebuilt each turn, so in-memory state does NOT survive
-        # between turns — the ledger must be durable for never-repeat to hold.
+        # the provider is rebuilt each turn, so in-memory state does not survive
+        # between turns; the ledger must be durable for never-repeat to hold.
         # _seen_path() is None only when unscoped (no session), in which case we
         # fall back to the in-memory mirror.
         seen_path = self._seen_path()
@@ -1539,8 +1529,8 @@ class HindsightMemoryProvider(MemoryProvider):
                 recall_kwargs["tags_match"] = self._recall_tags_match
             if self._recall_types:
                 recall_kwargs["types"] = self._recall_types
-            # Request trace ONLY when a score floor is set — trace payloads are
-            # ~10x larger, so we don't pay for scores we won't use.
+            # Request trace only when a score floor is set — trace payloads are
+            # ~10x larger, so avoid fetching scores that won't be used.
             want_scores = bool(self._recall_min_score and self._recall_min_score > 0)
             if want_scores:
                 recall_kwargs["trace"] = True
@@ -1551,7 +1541,7 @@ class HindsightMemoryProvider(MemoryProvider):
             num_results = len(results)
             logger.debug("Recall: returned %d results", num_results)
 
-            # RELEVANCE floor. Cross-encoder scores live in
+            # Relevance floor. Cross-encoder scores live in
             # trace.reranked[].score_components.cross_encoder_score, joined to
             # results by id == node_id. Missing score → keep (fail-open).
             if want_scores:
@@ -1575,8 +1565,9 @@ class HindsightMemoryProvider(MemoryProvider):
                                  self._recall_min_score, len(kept), len(results))
                     results = kept
 
-            # DON'T-REPEAT, then CAP. repeat_after = -1 never repeat this
-            # session (default); 0 off; N>0 may reappear after N turns.
+            # Suppress already-shown observations, then cap. repeat_after = -1
+            # never repeats this session (default); 0 off; N > 0 may reappear
+            # after N turns.
             repeat_after = self._recall_suppress_window
 
             def _already_shown(rid: str) -> bool:
