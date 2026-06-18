@@ -647,9 +647,31 @@ class HindsightMemoryProvider(MemoryProvider):
         self._recall_prompt_preamble = ""
         self._recall_max_input_chars = 800
 
+        # relevance + novelty controls for auto-recall.
+        # The stock plugin flattens EVERY recalled result into context on every
+        # turn (no cap, no dedup) — for a bank that fits under recall_max_tokens
+        # that means the whole bank, re-injected each message. These three knobs
+        # cap the count, suppress recently-shown observations, and reserve a
+        # score floor for later. Set all to 0 to reproduce stock behavior.
+        self._recall_top_k = 8            # max observations injected per turn (0 = unlimited)
+        # Novelty: -1 = NEVER re-inject an observation already shown this
+        # session (default); 0 = no suppression (repeats allowed); N>0 = let an
+        # observation come back after N recall turns.
+        self._recall_suppress_window = -1
+        self._recall_min_score = 0.0      # drop results below this cross-encoder score (0 = off; needs trace)
+        self._recently_shown: Dict[str, int] = {}  # observation id -> recall-turn last injected
+        self._recall_turn = 0             # monotonic per-turn counter for the novelty window
+
         # Bank
         self._bank_mission = ""
         self._bank_retain_mission: str | None = None
+        # extra bank-config knobs we ACTUALLY push to the
+        # bank on initialize(). The stock plugin reads bank_*mission and never
+        # sends them (dead keys); we apply them via the Hindsight bank-config
+        # API. None = "leave the bank's current value untouched".
+        self._observations_mission: str | None = None
+        self._retain_extraction_mode: str | None = None
+        self._retain_custom_instructions: str | None = None
         self._bank_id_template = ""
 
     @property
@@ -923,8 +945,11 @@ class HindsightMemoryProvider(MemoryProvider):
             {"key": "llm_model", "description": "LLM model", "default": "gpt-4o-mini", "default_from": {"field": "llm_provider", "map": _PROVIDER_DEFAULT_MODELS}, "when": {"mode": "local_embedded"}},
             {"key": "bank_id", "description": "Memory bank name (static fallback when bank_id_template is unset)", "default": "hermes"},
             {"key": "bank_id_template", "description": "Optional template to derive bank_id dynamically. Placeholders: {profile}, {workspace}, {platform}, {user}, {session}. Example: hermes-{profile}", "default": ""},
-            {"key": "bank_mission", "description": "Mission/purpose description for the memory bank"},
-            {"key": "bank_retain_mission", "description": "Custom extraction prompt for memory retention"},
+            {"key": "bank_mission", "description": "pushed to the bank as reflect_mission (first-person identity/framing for reflect). Empty = leave bank as-is."},
+            {"key": "bank_retain_mission", "description": "pushed to the bank as retain_mission — steers WHAT gets extracted from each turn. Empty = leave bank as-is."},
+            {"key": "observations_mission", "description": "pushed to the bank as observations_mission — steers WHAT gets synthesized into durable observations (the layer recall surfaces). Highest-leverage knob for reducing junk. Empty = leave bank as-is."},
+            {"key": "retain_extraction_mode", "description": "pushed to the bank — fact extraction mode. Empty = leave bank as-is.", "choices": ["concise", "verbose", "custom"]},
+            {"key": "retain_custom_instructions", "description": "pushed to the bank — custom extraction prompt (only active when retain_extraction_mode='custom'). Empty = leave bank as-is."},
             {"key": "recall_budget", "description": "Recall thoroughness", "default": "mid", "choices": ["low", "mid", "high"]},
             {"key": "memory_mode", "description": "Memory integration mode", "default": "hybrid", "choices": ["hybrid", "context", "tools"]},
             {"key": "recall_prefetch_method", "description": "Auto-recall method", "default": "recall", "choices": ["recall", "reflect"]},
@@ -943,6 +968,9 @@ class HindsightMemoryProvider(MemoryProvider):
             {"key": "retain_context", "description": "Context label for retained memories", "default": "conversation between Hermes Agent and the User"},
             {"key": "recall_max_tokens", "description": "Maximum tokens for recall results", "default": 4096},
             {"key": "recall_max_input_chars", "description": "Maximum input query length for auto-recall", "default": 800},
+            {"key": "recall_top_k", "description": "max observations injected per auto-recall turn (0 = unlimited, original behavior)", "default": 8},
+            {"key": "recall_suppress_window", "description": "don't re-feed the agent observations it has already been shown. -1 (default) = never repeat an observation already shown this session; 0 = off (repeats allowed every turn); N>0 = allow an observation to reappear after N auto-recall turns. Resets each new session.", "default": -1},
+            {"key": "recall_min_score", "description": "drop auto-recall results whose cross-encoder relevance score is below this (0.0-1.0; 0 = off). When >0, recall is fetched with trace to obtain scores. Try ~0.05-0.1 to cut the long noise tail.", "default": 0.0},
             {"key": "recall_prompt_preamble", "description": "Custom preamble for recalled memories in context"},
             {"key": "timeout", "description": "API request timeout in seconds", "default": _DEFAULT_TIMEOUT},
             {"key": "idle_timeout", "description": "Embedded daemon idle timeout in seconds (0 disables auto-shutdown)", "default": _DEFAULT_IDLE_TIMEOUT, "when": {"mode": "local_embedded"}},
@@ -1242,6 +1270,9 @@ class HindsightMemoryProvider(MemoryProvider):
         # Bank options
         self._bank_mission = self._config.get("bank_mission", "")
         self._bank_retain_mission = self._config.get("bank_retain_mission") or None
+        self._observations_mission = self._config.get("observations_mission") or None
+        self._retain_extraction_mode = self._config.get("retain_extraction_mode") or None
+        self._retain_custom_instructions = self._config.get("retain_custom_instructions") or None
 
         # Tags
         self._retain_tags = _normalize_retain_tags(
@@ -1286,6 +1317,10 @@ class HindsightMemoryProvider(MemoryProvider):
             self._recall_types = list(configured_types) or ["observation"]
         self._recall_prompt_preamble = self._config.get("recall_prompt_preamble", "")
         self._recall_max_input_chars = int(self._config.get("recall_max_input_chars", 800))
+        # relevance + novelty controls
+        self._recall_top_k = int(self._config.get("recall_top_k", 8))
+        self._recall_suppress_window = int(self._config.get("recall_suppress_window", -1))
+        self._recall_min_score = float(self._config.get("recall_min_score", 0.0))
         self._retain_async = self._config.get("retain_async", True)
 
         _client_version = "unknown"
@@ -1305,6 +1340,19 @@ class HindsightMemoryProvider(MemoryProvider):
                      self._auto_retain, self._auto_recall, self._retain_every_n_turns,
                      self._retain_async, self._retain_context, self._recall_max_tokens, self._recall_max_input_chars,
                      self._tags, self._recall_tags)
+
+        # push configured bank-level missions / extraction
+        # settings to the bank, in the background so a slow config PUT never
+        # blocks chat startup. Fires only when at least one knob is set; each
+        # unset (None) value leaves the bank's current setting untouched.
+        if any((self._bank_retain_mission, self._observations_mission,
+                self._bank_mission, self._retain_extraction_mode,
+                self._retain_custom_instructions)):
+            threading.Thread(
+                target=self._apply_bank_config,
+                daemon=True,
+                name="hindsight-bankcfg",
+            ).start()
 
         # For local mode, start the embedded daemon in the background so it
         # doesn't block the chat. Redirect stdout/stderr to a log file to
@@ -1352,6 +1400,47 @@ class HindsightMemoryProvider(MemoryProvider):
             t = threading.Thread(target=_start_daemon, daemon=True, name="hindsight-daemon-start")
             t.start()
 
+    def _apply_bank_config(self) -> None:
+        """Push configured bank-level missions / extraction settings to the bank.
+
+        This is the piece the stock Hindsight plugin is missing: it reads
+        ``bank_mission`` / ``bank_retain_mission`` from config and then never
+        sends them, so they're dead keys. This plugin actually applies
+        them — plus ``observations_mission`` (which has no stock config key at
+        all) and the extraction-mode knobs — via the Hindsight bank-config API
+        (``PUT /banks/{id}/config``, the same endpoint as ``hindsight bank
+        set-config``).
+
+        Only keys the user explicitly set are sent; an unset value is omitted
+        so the bank's current setting is left untouched (never blanked).
+        Best-effort: any failure is logged and never breaks initialization or
+        the chat. Runs on a background thread (see initialize()).
+        """
+        updates: Dict[str, Any] = {}
+        if self._bank_retain_mission:
+            updates["retain_mission"] = self._bank_retain_mission
+        if self._observations_mission:
+            updates["observations_mission"] = self._observations_mission
+        if self._bank_mission:
+            updates["reflect_mission"] = self._bank_mission
+        if self._retain_extraction_mode:
+            updates["retain_extraction_mode"] = self._retain_extraction_mode
+        if self._retain_custom_instructions:
+            updates["retain_custom_instructions"] = self._retain_custom_instructions
+        if not updates:
+            return
+        bank_id = self._bank_id
+        try:
+            logger.info("applying bank config to %s: %s",
+                        bank_id, sorted(updates.keys()))
+            self._run_hindsight_operation(
+                lambda client: client._aupdate_bank_config(bank_id, updates)
+            )
+            logger.info("bank config applied to %s", bank_id)
+        except Exception as exc:
+            logger.warning("failed to apply bank config to %s: %s",
+                           bank_id, exc)
+
     def system_prompt_block(self) -> str:
         if self._memory_mode == "context":
             return (
@@ -1375,67 +1464,196 @@ class HindsightMemoryProvider(MemoryProvider):
         )
 
     def prefetch(self, query: str, *, session_id: str = "") -> str:
-        if self._prefetch_thread and self._prefetch_thread.is_alive():
-            logger.debug("Prefetch: waiting for background thread to complete")
-            self._prefetch_thread.join(timeout=3.0)
-        with self._prefetch_lock:
-            result = self._prefetch_result
-            self._prefetch_result = ""
-        if not result:
-            logger.debug("Prefetch: no results available")
+        """Recall observations for the CURRENT message and return them to inject.
+
+        This recalls **synchronously** against ``query`` — the message the agent
+        is about to answer. The stock plugin (and our earlier versions) used a
+        prefetch/queue model that recalled on the PREVIOUS turn's message and
+        served it one turn late, so the agent answered a question without the
+        memories relevant to it. The cost of doing it right is that the recall's
+        latency is now on the turn's critical path (bounded by the configured
+        request timeout). Returns "" on any skip/failure — memory is
+        best-effort and must never break a turn.
+        """
+        text = self._recall_for_query(query)
+        if not text:
             return ""
-        logger.debug("Prefetch: returning %d chars of context", len(result))
         header = self._recall_prompt_preamble or (
             "# Hindsight Memory (persistent cross-session context)\n"
             "Use this to answer questions about the user and prior sessions. "
             "Do not call tools to look up information that is already present here."
         )
-        return f"{header}\n\n{result}"
+        return f"{header}\n\n{text}"
 
     def queue_prefetch(self, query: str, *, session_id: str = "") -> None:
+        """No-op. Recall now runs synchronously in prefetch() against the
+        current message. The stock pre-warm model recalled on the just-finished
+        message and surfaced it a turn late, so the agent always saw the
+        PREVIOUS message's observations. Kept as a no-op so the MemoryManager's
+        post-turn queue_prefetch_all() call stays harmless.
+        """
+        return
+
+    def _recall_for_query(self, query: str) -> str:
+        """Recall for *query* now; return the filtered, formatted bullet text.
+
+        Synchronous (blocks until recall completes, bounded by the configured
+        request timeout) so the result is for the message being answered.
+        Applies the relevance floor, don't-repeat, and top-k cap. Returns "" on
+        any skip or failure (fail-open).
+        """
         if self._memory_mode == "tools":
-            logger.debug("Prefetch: skipped (tools-only mode)")
-            return
+            logger.debug("Recall: skipped (tools-only mode)")
+            return ""
         if not self._auto_recall:
-            logger.debug("Prefetch: skipped (auto_recall disabled)")
-            return
+            logger.debug("Recall: skipped (auto_recall disabled)")
+            return ""
         if self._shutting_down.is_set():
-            logger.debug("Prefetch: skipped (shutting down)")
-            return
-        # Truncate query to max chars
+            logger.debug("Recall: skipped (shutting down)")
+            return ""
+        if not query:
+            return ""
         if self._recall_max_input_chars and len(query) > self._recall_max_input_chars:
             query = query[:self._recall_max_input_chars]
 
-        def _run():
-            try:
-                if self._prefetch_method == "reflect":
-                    logger.debug("Prefetch: calling reflect (bank=%s, query_len=%d)", self._bank_id, len(query))
-                    resp = self._run_hindsight_operation(lambda client: client.areflect(bank_id=self._bank_id, query=query, budget=self._budget))
-                    text = resp.text or ""
-                else:
-                    recall_kwargs: dict = {
-                        "bank_id": self._bank_id, "query": query,
-                        "budget": self._budget, "max_tokens": self._recall_max_tokens,
-                    }
-                    if self._recall_tags:
-                        recall_kwargs["tags"] = self._recall_tags
-                        recall_kwargs["tags_match"] = self._recall_tags_match
-                    if self._recall_types:
-                        recall_kwargs["types"] = self._recall_types
-                    logger.debug("Prefetch: calling recall (bank=%s, query_len=%d, budget=%s)",
-                                 self._bank_id, len(query), self._budget)
-                    resp = self._run_hindsight_operation(lambda client: client.arecall(**recall_kwargs))
-                    num_results = len(resp.results) if resp.results else 0
-                    logger.debug("Prefetch: recall returned %d results", num_results)
-                    text = "\n".join(f"- {r.text}" for r in resp.results if r.text) if resp.results else ""
-                if text:
-                    with self._prefetch_lock:
-                        self._prefetch_result = text
-            except Exception as e:
-                logger.debug("Hindsight prefetch failed: %s", e, exc_info=True)
+        # Load this session's "already shown" ledger from disk. In production
+        # the provider is rebuilt each turn, so in-memory state does NOT survive
+        # between turns — the ledger must be durable for never-repeat to hold.
+        # _seen_path() is None only when unscoped (no session), in which case we
+        # fall back to the in-memory mirror.
+        seen_path = self._seen_path()
+        prev_turn, shown = self._load_seen(seen_path)
+        _this_turn = prev_turn + 1
+        try:
+            if self._prefetch_method == "reflect":
+                logger.debug("Recall: calling reflect (bank=%s, query_len=%d)", self._bank_id, len(query))
+                resp = self._run_hindsight_operation(lambda client: client.areflect(bank_id=self._bank_id, query=query, budget=self._budget))
+                return resp.text or ""
 
-        self._prefetch_thread = threading.Thread(target=_run, daemon=True, name="hindsight-prefetch")
-        self._prefetch_thread.start()
+            recall_kwargs: dict = {
+                "bank_id": self._bank_id, "query": query,
+                "budget": self._budget, "max_tokens": self._recall_max_tokens,
+            }
+            if self._recall_tags:
+                recall_kwargs["tags"] = self._recall_tags
+                recall_kwargs["tags_match"] = self._recall_tags_match
+            if self._recall_types:
+                recall_kwargs["types"] = self._recall_types
+            # Request trace ONLY when a score floor is set — trace payloads are
+            # ~10x larger, so we don't pay for scores we won't use.
+            want_scores = bool(self._recall_min_score and self._recall_min_score > 0)
+            if want_scores:
+                recall_kwargs["trace"] = True
+            logger.debug("Recall: calling recall (bank=%s, query_len=%d, budget=%s)",
+                         self._bank_id, len(query), self._budget)
+            resp = self._run_hindsight_operation(lambda client: client.arecall(**recall_kwargs))
+            results = list(resp.results) if resp.results else []
+            num_results = len(results)
+            logger.debug("Recall: returned %d results", num_results)
+
+            # RELEVANCE floor. Cross-encoder scores live in
+            # trace.reranked[].score_components.cross_encoder_score, joined to
+            # results by id == node_id. Missing score → keep (fail-open).
+            if want_scores:
+                tr = getattr(resp, "trace", None)
+                reranked = tr.get("reranked") if isinstance(tr, dict) else None
+                score_by_id: Dict[str, float] = {}
+                for rr in reranked or []:
+                    nid = rr.get("node_id")
+                    ce = (rr.get("score_components") or {}).get("cross_encoder_score")
+                    if nid is not None and ce is not None:
+                        score_by_id[nid] = ce
+                if not score_by_id:
+                    logger.warning("Recall: recall_min_score=%.3f set but no trace "
+                                   "scores returned; skipping score floor",
+                                   self._recall_min_score)
+                else:
+                    kept = [r for r in results
+                            if score_by_id.get(getattr(r, "id", "") or "", 1.0)
+                            >= self._recall_min_score]
+                    logger.debug("Recall: score floor %.3f kept %d/%d results",
+                                 self._recall_min_score, len(kept), len(results))
+                    results = kept
+
+            # DON'T-REPEAT, then CAP. repeat_after = -1 never repeat this
+            # session (default); 0 off; N>0 may reappear after N turns.
+            repeat_after = self._recall_suppress_window
+
+            def _already_shown(rid: str) -> bool:
+                if not rid or repeat_after == 0:
+                    return False
+                last = shown.get(rid)
+                if last is None:
+                    return False
+                if repeat_after < 0:
+                    return True  # shown once this session -> never again
+                return (_this_turn - last) < repeat_after
+
+            fresh = [r for r in results if not _already_shown(getattr(r, "id", "") or "")]
+            if self._recall_top_k and self._recall_top_k > 0:
+                fresh = fresh[:self._recall_top_k]
+            if repeat_after != 0:
+                for r in fresh:
+                    rid = getattr(r, "id", "") or ""
+                    if rid:
+                        shown[rid] = _this_turn
+                if repeat_after > 0:
+                    cutoff = _this_turn - repeat_after
+                    shown = {k: v for k, v in shown.items() if v > cutoff}
+                self._save_seen(seen_path, _this_turn, shown)
+            # Mirror to memory (used for the unscoped/sessionless fallback + tests).
+            self._recently_shown = shown
+            self._recall_turn = _this_turn
+            logger.debug("Recall: kept %d/%d results (top_k=%s, repeat_after=%s)",
+                         len(fresh), num_results, self._recall_top_k, repeat_after)
+            return "\n".join(f"- {r.text}" for r in fresh if r.text) if fresh else ""
+        except Exception as e:
+            logger.debug("Hindsight recall failed: %s", e, exc_info=True)
+            return ""
+
+    def _seen_path(self):
+        """Path to this session's 'already shown' ledger, or None if unscoped.
+
+        Keyed by bank + session so never-repeat is per-conversation and survives
+        the provider being rebuilt each turn. Returns None when there's no
+        session_id, in which case _recall_for_query falls back to in-memory
+        state.
+        """
+        if not self._session_id:
+            return None
+        bank = _sanitize_bank_segment(self._bank_id) or "bank"
+        sess = _sanitize_bank_segment(self._session_id) or "session"
+        return get_hermes_home() / "hindsight" / "seen" / f"{bank}__{sess}.json"
+
+    def _load_seen(self, path):
+        """Load (recall_turn, {observation_id: turn_last_shown}) from *path*.
+
+        Fail-open: a missing or corrupt file yields a fresh ledger so a read
+        error can never wipe or block recall. When *path* is None, mirror the
+        in-memory state instead.
+        """
+        if path is None:
+            return self._recall_turn, dict(self._recently_shown)
+        try:
+            if path.exists():
+                data = json.loads(path.read_text(encoding="utf-8"))
+                turn = int(data.get("turn", 0))
+                shown = {str(k): int(v) for k, v in (data.get("shown") or {}).items()}
+                return turn, shown
+        except Exception as exc:
+            logger.debug("could not read seen ledger %s: %s", path, exc)
+        return 0, {}
+
+    def _save_seen(self, path, turn, shown) -> None:
+        """Persist the ledger atomically. Best-effort; failures are logged."""
+        if path is None:
+            return
+        try:
+            path.parent.mkdir(parents=True, exist_ok=True)
+            from utils import atomic_json_write
+            atomic_json_write(path, {"turn": int(turn), "shown": shown})
+        except Exception as exc:
+            logger.debug("could not write seen ledger %s: %s", path, exc)
 
     def _build_turn_messages(self, user_content: str, assistant_content: str) -> List[Dict[str, str]]:
         now = datetime.now(timezone.utc).isoformat()
@@ -1808,6 +2026,11 @@ class HindsightMemoryProvider(MemoryProvider):
         self._turn_counter = 0
         self._turn_index = 0
         self._last_retained_turn_count = 0
+        # novelty state is per-session; a new conversation
+        # starts with a clean slate so prior-session observations aren't
+        # suppressed (and the seen-map doesn't leak across sessions).
+        self._recently_shown.clear()
+        self._recall_turn = 0
         logger.debug(
             "Hindsight on_session_switch: new_session=%s parent=%s reset=%s doc=%s",
             self._session_id, self._parent_session_id, reset, self._document_id,

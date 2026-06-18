@@ -733,71 +733,186 @@ class TestToolHandlers:
 # ---------------------------------------------------------------------------
 
 
-class TestPrefetch:
-    def test_prefetch_returns_empty_when_no_result(self, provider):
-        assert provider.prefetch("test") == ""
+def _scored_results(*items):
+    """Build a recall response with id'd results and optional cross-encoder
+    scores in trace.reranked. Each item is (id, text) or (id, text, score)."""
+    results = [SimpleNamespace(id=i[0], text=i[1]) for i in items]
+    reranked = [
+        {"node_id": i[0], "score_components": {"cross_encoder_score": i[2]}}
+        for i in items if len(i) > 2
+    ]
+    return SimpleNamespace(results=results, trace={"reranked": reranked})
 
-    def test_prefetch_default_preamble(self, provider):
-        provider._prefetch_result = "- some memory"
+
+class TestPrefetch:
+    """prefetch() now recalls synchronously against the current query;
+    queue_prefetch() is a no-op."""
+
+    def test_prefetch_recalls_synchronously_with_default_header(self, provider):
         result = provider.prefetch("test")
         assert "Hindsight Memory" in result
-        assert "- some memory" in result
+        assert "- Memory 1" in result
+        assert "- Memory 2" in result
+
+    def test_prefetch_returns_empty_when_recall_has_no_results(self, provider):
+        provider._client.arecall = AsyncMock(return_value=SimpleNamespace(results=[]))
+        assert provider.prefetch("test") == ""
+
+    def test_prefetch_returns_empty_for_blank_query(self, provider):
+        assert provider.prefetch("") == ""
 
     def test_prefetch_custom_preamble(self, provider_with_config):
         p = provider_with_config(recall_prompt_preamble="Custom header:")
-        p._prefetch_result = "- memory line"
         result = p.prefetch("test")
         assert result.startswith("Custom header:")
-        assert "- memory line" in result
+        assert "- Memory 1" in result
 
-    def test_queue_prefetch_skipped_in_tools_mode(self, provider_with_config):
+    def test_prefetch_skipped_in_tools_mode(self, provider_with_config):
         p = provider_with_config(memory_mode="tools")
-        p.queue_prefetch("test")
-        # Should not start a thread
-        assert p._prefetch_thread is None
+        assert p.prefetch("test") == ""
+        p._client.arecall.assert_not_called()
 
-    def test_queue_prefetch_skipped_when_auto_recall_off(self, provider_with_config):
+    def test_prefetch_skipped_when_auto_recall_off(self, provider_with_config):
         p = provider_with_config(auto_recall=False)
-        p.queue_prefetch("test")
-        assert p._prefetch_thread is None
+        assert p.prefetch("test") == ""
+        p._client.arecall.assert_not_called()
 
-    def test_queue_prefetch_truncates_query(self, provider_with_config):
+    def test_prefetch_truncates_query(self, provider_with_config):
         p = provider_with_config(recall_max_input_chars=10)
-        # Mock _run_sync to capture the query
-        original_query = None
+        captured = {}
 
-        def _capture_recall(**kwargs):
-            nonlocal original_query
-            original_query = kwargs.get("query", "")
+        def _capture(**kwargs):
+            captured["query"] = kwargs.get("query", "")
             return SimpleNamespace(results=[])
 
-        p._client.arecall = AsyncMock(side_effect=_capture_recall)
+        p._client.arecall = AsyncMock(side_effect=_capture)
+        p.prefetch("a" * 100)
+        assert len(captured["query"]) <= 10
 
-        long_query = "a" * 100
-        p.queue_prefetch(long_query)
-        if p._prefetch_thread:
-            p._prefetch_thread.join(timeout=5.0)
-
-        # The query passed to arecall should be truncated
-        if original_query is not None:
-            assert len(original_query) <= 10
-
-    def test_queue_prefetch_passes_recall_params(self, provider_with_config):
+    def test_prefetch_passes_recall_params(self, provider_with_config):
         p = provider_with_config(
             recall_tags=["t1"],
             recall_tags_match="all",
             recall_max_tokens=1024,
             recall_types=["world"],
         )
-        p.queue_prefetch("test query")
-        if p._prefetch_thread:
-            p._prefetch_thread.join(timeout=5.0)
-
+        p.prefetch("test query")
         call_kwargs = p._client.arecall.call_args.kwargs
         assert call_kwargs["max_tokens"] == 1024
         assert call_kwargs["tags"] == ["t1"]
         assert call_kwargs["tags_match"] == "all"
         assert call_kwargs["types"] == ["world"]
+
+    def test_queue_prefetch_is_noop(self, provider):
+        # Recall is synchronous in prefetch() now; queue_prefetch must neither
+        # start a thread nor hit the client.
+        provider.queue_prefetch("test")
+        assert provider._prefetch_thread is None
+        provider._client.arecall.assert_not_called()
+
+
+class TestRecallFocus:
+    """Relevance floor, novelty/never-repeat window, and top-k cap."""
+
+    def test_top_k_caps_injected_observations(self, provider_with_config):
+        p = provider_with_config(recall_top_k=2, recall_suppress_window=0)
+        p._client.arecall = AsyncMock(return_value=_scored_results(
+            ("a", "A"), ("b", "B"), ("c", "C"), ("d", "D")))
+        text = p.prefetch("q")
+        assert "- A" in text and "- B" in text
+        assert "- C" not in text and "- D" not in text
+
+    def test_top_k_zero_is_unlimited(self, provider_with_config):
+        p = provider_with_config(recall_top_k=0, recall_suppress_window=0)
+        p._client.arecall = AsyncMock(return_value=_scored_results(
+            ("a", "A"), ("b", "B"), ("c", "C")))
+        text = p.prefetch("q")
+        assert all(s in text for s in ("- A", "- B", "- C"))
+
+    def test_suppress_window_never_repeats(self, provider_with_config):
+        p = provider_with_config(recall_suppress_window=-1, recall_top_k=0)
+        p._client.arecall = AsyncMock(return_value=_scored_results(("a", "A"), ("b", "B")))
+        first = p.prefetch("q")
+        assert "- A" in first and "- B" in first
+        # Same observations next turn -> never-repeat suppresses them entirely.
+        assert p.prefetch("q") == ""
+
+    def test_suppress_window_zero_allows_repeats(self, provider_with_config):
+        p = provider_with_config(recall_suppress_window=0, recall_top_k=0)
+        p._client.arecall = AsyncMock(return_value=_scored_results(("a", "A")))
+        assert "- A" in p.prefetch("q")
+        assert "- A" in p.prefetch("q")
+
+    def test_suppress_window_n_reappears_after_n_turns(self, provider_with_config):
+        p = provider_with_config(recall_suppress_window=2, recall_top_k=0)
+        p._client.arecall = AsyncMock(return_value=_scored_results(("a", "A")))
+        assert "- A" in p.prefetch("q")    # turn 1: shown
+        assert p.prefetch("q") == ""        # turn 2: within window -> suppressed
+        assert "- A" in p.prefetch("q")     # turn 3: window elapsed -> reappears
+
+    def test_min_score_drops_low_scoring_results(self, provider_with_config):
+        p = provider_with_config(recall_min_score=0.5, recall_suppress_window=0, recall_top_k=0)
+        p._client.arecall = AsyncMock(return_value=_scored_results(
+            ("a", "A", 0.9), ("b", "B", 0.2)))
+        text = p.prefetch("q")
+        assert "- A" in text and "- B" not in text
+
+    def test_min_score_requests_trace(self, provider_with_config):
+        p = provider_with_config(recall_min_score=0.5)
+        p._client.arecall = AsyncMock(return_value=_scored_results())
+        p.prefetch("q")
+        assert p._client.arecall.call_args.kwargs.get("trace") is True
+
+    def test_no_trace_requested_without_score_floor(self, provider):
+        provider.prefetch("test")
+        assert "trace" not in provider._client.arecall.call_args.kwargs
+
+    def test_seen_ledger_persisted_to_disk(self, provider):
+        provider._client.arecall = AsyncMock(return_value=_scored_results(("a", "A")))
+        provider.prefetch("q")
+        ledger = provider._seen_path()
+        assert ledger is not None and ledger.exists()
+        data = json.loads(ledger.read_text(encoding="utf-8"))
+        assert "a" in data["shown"]
+
+
+class TestBankConfigPush:
+    """_apply_bank_config pushes only explicitly-set bank knobs, fail-open."""
+
+    def test_pushes_only_set_knobs(self, provider):
+        provider._bank_retain_mission = "extract facts"
+        provider._observations_mission = "synthesize beliefs"
+        provider._bank_mission = "be helpful"
+        provider._retain_extraction_mode = "concise"
+        provider._retain_custom_instructions = "be terse"
+        provider._client._aupdate_bank_config = AsyncMock()
+        provider._apply_bank_config()
+        bank_id, updates = provider._client._aupdate_bank_config.call_args.args
+        assert bank_id == provider._bank_id
+        assert updates == {
+            "retain_mission": "extract facts",
+            "observations_mission": "synthesize beliefs",
+            "reflect_mission": "be helpful",
+            "retain_extraction_mode": "concise",
+            "retain_custom_instructions": "be terse",
+        }
+
+    def test_omits_unset_knobs(self, provider):
+        provider._observations_mission = "only this"
+        provider._client._aupdate_bank_config = AsyncMock()
+        provider._apply_bank_config()
+        _, updates = provider._client._aupdate_bank_config.call_args.args
+        assert updates == {"observations_mission": "only this"}
+
+    def test_noop_when_nothing_configured(self, provider):
+        provider._client._aupdate_bank_config = AsyncMock()
+        provider._apply_bank_config()
+        provider._client._aupdate_bank_config.assert_not_called()
+
+    def test_errors_are_swallowed(self, provider):
+        provider._observations_mission = "x"
+        provider._client._aupdate_bank_config = AsyncMock(side_effect=RuntimeError("boom"))
+        provider._apply_bank_config()  # must not raise
 
 
 # ---------------------------------------------------------------------------
@@ -1185,14 +1300,15 @@ class TestSessionSwitchBufferFlush:
         provider._client.aretain_batch.assert_not_called()
         assert provider._session_id == "new-sid"
 
-    def test_prefetch_result_cleared_on_switch(self, provider):
-        """Stale recall text from the old session must not leak into the
-        next session's first prefetch read."""
-        provider._prefetch_result = "old-session recall: User likes Rust"
+    def test_novelty_state_reset_on_switch(self, provider):
+        """A session switch clears the in-memory 'already shown' novelty state
+        so the new conversation re-surfaces observations instead of suppressing
+        them."""
+        provider._recently_shown = {"obs-1": 3}
+        provider._recall_turn = 3
         provider.on_session_switch("new-sid")
-        assert provider._prefetch_result == ""
-        # And subsequent prefetch() should now report empty, not the leftover.
-        assert provider.prefetch("anything") == ""
+        assert provider._recently_shown == {}
+        assert provider._recall_turn == 0
 
     def test_in_flight_prefetch_thread_drained_on_switch(self, provider, monkeypatch):
         """on_session_switch must wait for an in-flight prefetch from the
