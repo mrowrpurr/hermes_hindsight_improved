@@ -52,7 +52,11 @@ _DEFAULT_API_URL = "https://api.hindsight.vectorize.io"
 _DEFAULT_LOCAL_URL = "http://localhost:8888"
 _MIN_CLIENT_VERSION = "0.4.22"
 _DEFAULT_TIMEOUT = 120  # seconds — cloud API can take 30-40s per request
+_DEFAULT_RECALL_TIMEOUT = 30  # seconds — recall blocks the turn, so bound it tighter than retain
 _DEFAULT_IDLE_TIMEOUT = 300  # seconds — Hindsight embedded daemon default
+# Cap the per-session "already shown" ledger so never-repeat (window = -1)
+# can't grow the on-disk file without bound over a very long session.
+_SEEN_LEDGER_MAX = 5000
 # Mirrors hindsight-integrations/openclaw — Hindsight 0.5.0 added
 # `update_mode='append'` semantics on retain (vectorize-io/hindsight#932).
 # Without it, reusing a stable session-scoped document_id silently
@@ -596,6 +600,7 @@ class HindsightMemoryProvider(MemoryProvider):
         self._turn_index = 0
         self._client = None
         self._timeout = _DEFAULT_TIMEOUT
+        self._recall_timeout = _DEFAULT_RECALL_TIMEOUT
         self._idle_timeout = _DEFAULT_IDLE_TIMEOUT
         self._prefetch_result = ""
         self._prefetch_lock = threading.Lock()
@@ -971,6 +976,7 @@ class HindsightMemoryProvider(MemoryProvider):
             {"key": "recall_min_score", "description": "Drop auto-recall results whose cross-encoder relevance score is below this (0.0-1.0; 0 = off). When >0, recall is fetched with trace to obtain scores. Try ~0.05-0.1 to drop the low-relevance tail.", "default": 0.0},
             {"key": "recall_prompt_preamble", "description": "Custom preamble for recalled memories in context"},
             {"key": "timeout", "description": "API request timeout in seconds", "default": _DEFAULT_TIMEOUT},
+            {"key": "recall_timeout", "description": "Timeout in seconds for auto-recall, which blocks the turn. Kept below the general request timeout so a slow recall can't stall a turn for the full budget. Raise it if you use the slower reflect prefetch method.", "default": _DEFAULT_RECALL_TIMEOUT},
             {"key": "idle_timeout", "description": "Embedded daemon idle timeout in seconds (0 disables auto-shutdown)", "default": _DEFAULT_IDLE_TIMEOUT, "when": {"mode": "local_embedded"}},
         ]
 
@@ -1112,11 +1118,17 @@ class HindsightMemoryProvider(MemoryProvider):
         except Exception as exc:
             logger.debug("Hindsight atexit shutdown failed: %s", exc)
 
-    def _run_hindsight_operation(self, operation):
-        """Run an async Hindsight client operation, retrying once after idle shutdown."""
+    def _run_hindsight_operation(self, operation, *, timeout=None):
+        """Run an async Hindsight client operation, retrying once after idle shutdown.
+
+        *timeout* bounds the call (seconds); defaults to the configured request
+        timeout. Recall passes the tighter recall_timeout so a slow recall can't
+        stall the turn for the full retain budget.
+        """
+        run_timeout = timeout if timeout is not None else self._timeout
         client = self._get_client()
         try:
-            return self._run_sync(operation(client))
+            return _run_sync(operation(client), timeout=run_timeout)
         except Exception as exc:
             if not self._is_retriable_embedded_connection_error(exc):
                 raise
@@ -1127,7 +1139,7 @@ class HindsightMemoryProvider(MemoryProvider):
             self._client = None
             client = self._get_client()
             self._client = client
-            return self._run_sync(operation(client))
+            return _run_sync(operation(client), timeout=run_timeout)
 
     def _probe_url(self) -> str:
         """Return the URL to probe /version on.
@@ -1222,6 +1234,9 @@ class HindsightMemoryProvider(MemoryProvider):
         self._timeout = _parse_int_setting(
             self._config.get("timeout") if self._config.get("timeout") is not None else os.environ.get("HINDSIGHT_TIMEOUT"),
             _DEFAULT_TIMEOUT,
+        )
+        self._recall_timeout = _parse_int_setting(
+            self._config.get("recall_timeout"), _DEFAULT_RECALL_TIMEOUT
         )
         self._idle_timeout = _parse_int_setting(
             self._config.get("idle_timeout") if self._config.get("idle_timeout") is not None else os.environ.get("HINDSIGHT_IDLE_TIMEOUT"),
@@ -1531,7 +1546,10 @@ class HindsightMemoryProvider(MemoryProvider):
         try:
             if self._prefetch_method == "reflect":
                 logger.debug("Recall: calling reflect (bank=%s, query_len=%d)", self._bank_id, len(query))
-                resp = self._run_hindsight_operation(lambda client: client.areflect(bank_id=self._bank_id, query=query, budget=self._budget))
+                resp = self._run_hindsight_operation(
+                    lambda client: client.areflect(bank_id=self._bank_id, query=query, budget=self._budget),
+                    timeout=self._recall_timeout,
+                )
                 return resp.text or ""
 
             recall_kwargs: dict = {
@@ -1550,7 +1568,10 @@ class HindsightMemoryProvider(MemoryProvider):
                 recall_kwargs["trace"] = True
             logger.debug("Recall: calling recall (bank=%s, query_len=%d, budget=%s)",
                          self._bank_id, len(query), self._budget)
-            resp = self._run_hindsight_operation(lambda client: client.arecall(**recall_kwargs))
+            resp = self._run_hindsight_operation(
+                lambda client: client.arecall(**recall_kwargs),
+                timeout=self._recall_timeout,
+            )
             results = list(resp.results) if resp.results else []
             num_results = len(results)
             logger.debug("Recall: returned %d results", num_results)
@@ -1605,6 +1626,12 @@ class HindsightMemoryProvider(MemoryProvider):
                 if repeat_after > 0:
                     cutoff = _this_turn - repeat_after
                     shown = {k: v for k, v in shown.items() if v > cutoff}
+                if len(shown) > _SEEN_LEDGER_MAX:
+                    # Bound the ledger by keeping the most-recently-shown ids.
+                    # For never-repeat (-1) this can let a very old observation
+                    # reappear once — an acceptable trade for a bounded file.
+                    shown = dict(sorted(shown.items(), key=lambda kv: kv[1],
+                                        reverse=True)[:_SEEN_LEDGER_MAX])
                 self._save_seen(seen_path, _this_turn, shown)
             # Mirror to memory (used for the unscoped/sessionless fallback + tests).
             self._recently_shown = shown

@@ -875,6 +875,34 @@ class TestRecallFocus:
         data = json.loads(ledger.read_text(encoding="utf-8"))
         assert "a" in data["shown"]
 
+    def test_seen_ledger_is_bounded(self, provider, monkeypatch):
+        import plugins.memory.hindsight as mod
+        monkeypatch.setattr(mod, "_SEEN_LEDGER_MAX", 3)
+        # Default provider never-repeats (-1); feed 5 distinct observations.
+        provider._client.arecall = AsyncMock(return_value=_scored_results(
+            ("a", "A"), ("b", "B"), ("c", "C"), ("d", "D"), ("e", "E")))
+        provider.prefetch("q")
+        _, shown = provider._load_seen(provider._seen_path())
+        assert len(shown) == 3
+
+    def test_recall_timeout_from_config(self, provider_with_config):
+        p = provider_with_config(recall_timeout=9)
+        assert p._recall_timeout == 9
+
+    def test_recall_uses_recall_timeout(self, provider_with_config, monkeypatch):
+        import plugins.memory.hindsight as mod
+        p = provider_with_config(recall_timeout=7)
+        captured = {}
+
+        def _fake_run_sync(coro, timeout=None):
+            captured["timeout"] = timeout
+            coro.close()  # suppress un-awaited coroutine warning
+            return SimpleNamespace(results=[])
+
+        monkeypatch.setattr(mod, "_run_sync", _fake_run_sync)
+        p.prefetch("q")
+        assert captured["timeout"] == 7
+
 
 class _FakeBankClient:
     """Minimal client exposing a single async bank-config update method.
