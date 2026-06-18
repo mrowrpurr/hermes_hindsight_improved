@@ -1,0 +1,8 @@
+name: hindsight_improved
+version: 1.0.0
+description: "Hindsight (improved) — long-term memory with synchronous relevance-filtered recall, novelty suppression, and bank-config control."
+pip_dependencies:
+  - "hindsight-client>=0.4.22"
+requires_env: []
+hooks:
+  - on_session_end
