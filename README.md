@@ -4,6 +4,26 @@ Long-term memory with knowledge graph, entity resolution, and multi-strategy ret
 
 Distributed as the **`hindsight_improved`** plugin — an enhanced, drop-in variant of the built-in `hindsight` provider. It adds synchronous (same-turn) recall, relevance/novelty filtering (`recall_top_k`, `recall_suppress_window`, `recall_min_score`), and bank-config control (`observations_mission`, extraction mode). Set `memory.provider` to `hindsight_improved` to use it; config still lives under `~/.hermes/hindsight/`.
 
+## Install
+
+```bash
+hermes plugins install mrowrpurr/hermes_hindsight_improved
+```
+
+That clones this repo's `main` branch into `~/.hermes/plugins/` and prompts to enable the `hindsight_improved` plugin. If you skip the prompt, enable it later:
+
+```bash
+hermes plugins enable hindsight_improved
+```
+
+Then select it as your memory provider (or use the **Setup** wizard below):
+
+```bash
+hermes config set memory.provider hindsight_improved
+```
+
+Update to the latest with `hermes plugins update hindsight_improved`. Config lives under `~/.hermes/hindsight/` (shared with the built-in provider), so an existing Hindsight setup carries over.
+
 ## Requirements
 
 - **Cloud:** API key from [ui.hindsight.vectorize.io](https://ui.hindsight.vectorize.io)
@@ -162,3 +182,15 @@ Available in `hybrid` and `tools` memory modes:
 ## Client Version
 
 Requires `hindsight-client >= 0.4.22`. The plugin auto-upgrades on session start if an older version is detected.
+
+## Repository layout
+
+This repo is a fork of [hermes-agent](https://github.com/NousResearch/hermes-agent). It carries three branches, each with a distinct job:
+
+| Branch | Purpose |
+|--------|---------|
+| `main` | **The installable plugin** (this branch — what `hermes plugins install` consumes). Flat layout: `__init__.py`, `plugin.yaml`, and this `README.md` at the repo root. |
+| `hermes-agent-hindsight-plugin-changes` | **Source of truth.** The provider changes on top of upstream hermes-agent (under `plugins/memory/hindsight/`), with the full test suite. Rebased periodically onto `hermes-agent` to stay current, and the basis for a possible upstream PR (undecided). |
+| `hermes-agent` | A plain local mirror of upstream hermes-agent's `main`, kept so the source-of-truth branch can be rebased against it without network round-trips. |
+
+The plugin code on `main` is identical to the source-of-truth branch except the two name strings (`plugin.yaml` `name` and the provider `name` property), which are `hindsight_improved` here so it installs alongside the built-in `hindsight` provider.
