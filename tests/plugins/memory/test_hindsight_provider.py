@@ -876,6 +876,26 @@ class TestRecallFocus:
         assert "a" in data["shown"]
 
 
+class _FakeBankClient:
+    """Minimal client exposing a single async bank-config update method.
+
+    public=False exposes only the private ``_aupdate_bank_config`` (matching
+    current hindsight-client); public=True exposes ``aupdate_bank_config``.
+    A real object (not a MagicMock) so getattr probing reflects reality.
+    """
+
+    def __init__(self, *, public=False, fail=False):
+        self.calls = []
+        self._fail = fail
+
+        async def _update(bank_id, updates):
+            if self._fail:
+                raise RuntimeError("boom")
+            self.calls.append((bank_id, dict(updates)))
+
+        setattr(self, "aupdate_bank_config" if public else "_aupdate_bank_config", _update)
+
+
 class TestBankConfigPush:
     """_apply_bank_config pushes only explicitly-set bank knobs, fail-open."""
 
@@ -885,33 +905,41 @@ class TestBankConfigPush:
         provider._bank_mission = "be helpful"
         provider._retain_extraction_mode = "concise"
         provider._retain_custom_instructions = "be terse"
-        provider._client._aupdate_bank_config = AsyncMock()
+        provider._client = _FakeBankClient()
         provider._apply_bank_config()
-        bank_id, updates = provider._client._aupdate_bank_config.call_args.args
-        assert bank_id == provider._bank_id
-        assert updates == {
+        assert provider._client.calls == [(provider._bank_id, {
             "retain_mission": "extract facts",
             "observations_mission": "synthesize beliefs",
             "reflect_mission": "be helpful",
             "retain_extraction_mode": "concise",
             "retain_custom_instructions": "be terse",
-        }
+        })]
 
     def test_omits_unset_knobs(self, provider):
         provider._observations_mission = "only this"
-        provider._client._aupdate_bank_config = AsyncMock()
+        provider._client = _FakeBankClient()
         provider._apply_bank_config()
-        _, updates = provider._client._aupdate_bank_config.call_args.args
-        assert updates == {"observations_mission": "only this"}
+        assert provider._client.calls == [(provider._bank_id, {"observations_mission": "only this"})]
+
+    def test_prefers_public_method_when_available(self, provider):
+        provider._observations_mission = "x"
+        provider._client = _FakeBankClient(public=True)
+        provider._apply_bank_config()
+        assert provider._client.calls == [(provider._bank_id, {"observations_mission": "x"})]
 
     def test_noop_when_nothing_configured(self, provider):
-        provider._client._aupdate_bank_config = AsyncMock()
+        provider._client = _FakeBankClient()
         provider._apply_bank_config()
-        provider._client._aupdate_bank_config.assert_not_called()
+        assert provider._client.calls == []
+
+    def test_missing_method_is_swallowed(self, provider):
+        provider._observations_mission = "x"
+        provider._client = SimpleNamespace()  # no bank-config method at all
+        provider._apply_bank_config()  # must not raise
 
     def test_errors_are_swallowed(self, provider):
         provider._observations_mission = "x"
-        provider._client._aupdate_bank_config = AsyncMock(side_effect=RuntimeError("boom"))
+        provider._client = _FakeBankClient(fail=True)
         provider._apply_bank_config()  # must not raise
 
 

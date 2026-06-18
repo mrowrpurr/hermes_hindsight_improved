@@ -1425,12 +1425,26 @@ class HindsightMemoryProvider(MemoryProvider):
         if not updates:
             return
         bank_id = self._bank_id
+
+        def _update(client):
+            # Prefer a public async method if the client ever grows one;
+            # current hindsight-client only exposes the private impl. Raise
+            # (caught below) if neither exists so a client API change degrades
+            # gracefully instead of crashing init.
+            method = (
+                getattr(client, "aupdate_bank_config", None)
+                or getattr(client, "_aupdate_bank_config", None)
+            )
+            if method is None:
+                raise AttributeError(
+                    "hindsight client exposes no bank-config update method"
+                )
+            return method(bank_id, updates)
+
         try:
             logger.info("applying bank config to %s: %s",
                         bank_id, sorted(updates.keys()))
-            self._run_hindsight_operation(
-                lambda client: client._aupdate_bank_config(bank_id, updates)
-            )
+            self._run_hindsight_operation(_update)
             logger.info("bank config applied to %s", bank_id)
         except Exception as exc:
             logger.warning("failed to apply bank config to %s: %s",
