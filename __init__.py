@@ -1022,6 +1022,21 @@ class HindsightMemoryProvider(MemoryProvider):
                 kwargs["idle_timeout"] = idle_timeout
                 self._client = HindsightEmbedded(**kwargs)
             else:
+                # Ensure the cloud client dependency is present via the
+                # sanctioned Hermes mechanism (tools/lazy_deps): venv-scoped,
+                # allowlisted (memory.hindsight -> hindsight-client), honoring
+                # security.allow_lazy_installs. `hermes plugins install` does NOT
+                # install a plugin's declared pip_dependencies, so without this a
+                # fresh machine dies with "No module named hindsight_client" on
+                # the first recall/retain. The local-embedded branch above
+                # already does the same for its deps.
+                try:
+                    from tools.lazy_deps import ensure as _lazy_ensure
+                    _lazy_ensure("memory.hindsight", prompt=False)
+                except ImportError:
+                    pass  # lazy_deps unavailable; fall through to a plain import
+                except Exception as _e:
+                    raise ImportError(str(_e))
                 from hindsight_client import Hindsight
                 timeout = self._timeout or _DEFAULT_TIMEOUT
                 kwargs = {"base_url": self._api_url, "timeout": float(timeout)}
